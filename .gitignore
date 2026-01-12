@@ -59,3 +59,6 @@ eeprom.bin
 # config used for building targets
 /src/config
 
+# Betaflight custom Plugin for Gazebo11
+/betaflight_gazebo_plugin/build/
+/betaflight_gazebo_plugin/*.so
