@@ -24,7 +24,7 @@ RC_CENTER = 1500
 RC_MAX = 2000
 
 class BetaflightRC:
-    def __init__(self, host='127.0.0.1', port=5762):  # Port 5762
+    def __init__(self, host='127.0.0.1', port=5761):  # Port 5761 (UART1) - MSP default
         self.host = host
         self.port = port
         self.sock = None
@@ -125,13 +125,13 @@ class BetaflightRC:
         """
         # Update channels if provided
         if roll is not None:
-            self.channels[0] = int(RC_CENTER + (roll * 5))  # -500 to +500
+            self.channels[0] = int(RC_CENTER + (roll * 3))  # -300 to +300 (reduced sensitivity)
         if pitch is not None:
-            self.channels[1] = int(RC_CENTER + (pitch * 5))
+            self.channels[1] = int(RC_CENTER + (pitch * 3))  # -300 to +300 (reduced sensitivity)
         if throttle is not None:
             self.channels[2] = int(RC_MIN + (throttle * 10))  # 1000 to 2000
         if yaw is not None:
-            self.channels[3] = int(RC_CENTER + (yaw * 5))
+            self.channels[3] = int(RC_CENTER + (yaw * 4))  # -400 to +400 (slightly reduced)
 
         # AUX switches (1000=OFF, 2000=ON)
         if aux1 is not None:
@@ -223,11 +223,10 @@ class BetaflightRC:
         print("  KEYBOARD CONTROL MODE")
         print("="*50)
         print("\nKeyboard Controls:")
-        print("  W/S: Pitch (forward/back)")
-        print("  A/D: Roll (left/right)")
-        print("  Q/E: Yaw (rotate left/right)")
-        print("  I/K: Throttle (up/down) - 10% steps")
-        print("  U/J: Throttle (up/down) - 1% steps")
+        print("  W/S: Throttle (up/down)")
+        print("  A/D: Yaw (rotate left/right)")
+        print("  I/K: Pitch (forward/back)")
+        print("  J/L: Roll (left/right)")
         print("  R: ARM")
         print("  F: DISARM")
         print("  SPACE: Reset center (Roll/Pitch/Yaw to neutral)")
@@ -284,45 +283,37 @@ class BetaflightRC:
                     print("\n✗ Lost connection to SITL!")
                     return False
 
-                # Throttle control - Coarse (10%)
-                if key == keyboard.Key.up or (hasattr(key, 'char') and key.char == 'i'):
-                    throttle_percent = min(100, throttle_percent + 10)
-                    self.set_rc(throttle=throttle_percent)
-                elif key == keyboard.Key.down or (hasattr(key, 'char') and key.char == 'k'):
-                    throttle_percent = max(0, throttle_percent - 10)
-                    self.set_rc(throttle=throttle_percent)
-
-                # Throttle control - Fine (1%)
-                elif hasattr(key, 'char') and key.char == 'u':
+                # Throttle control (W/S)
+                if hasattr(key, 'char') and key.char == 'w':
                     throttle_percent = min(100, throttle_percent + 1)
                     self.set_rc(throttle=throttle_percent)
-                elif hasattr(key, 'char') and key.char == 'j':
+                elif hasattr(key, 'char') and key.char == 's':
                     throttle_percent = max(0, throttle_percent - 1)
                     self.set_rc(throttle=throttle_percent)
 
-                # Pitch (Forward/Backward)
-                elif hasattr(key, 'char') and key.char == 'w':
-                    pitch_percent = min(100, pitch_percent + 10)
-                    self.set_rc(pitch=pitch_percent)
-                elif hasattr(key, 'char') and key.char == 's':
-                    pitch_percent = max(-100, pitch_percent - 10)
-                    self.set_rc(pitch=pitch_percent)
-
-                # Roll (Left/Right)
+                # Yaw control (A/D)
                 elif hasattr(key, 'char') and key.char == 'a':
-                    roll_percent = max(-100, roll_percent - 10)
-                    self.set_rc(roll=roll_percent)
+                    yaw_percent = max(-100, yaw_percent - 1)
+                    self.set_rc(yaw=yaw_percent)
                 elif hasattr(key, 'char') and key.char == 'd':
-                    roll_percent = min(100, roll_percent + 10)
-                    self.set_rc(roll=roll_percent)
+                    yaw_percent = min(100, yaw_percent + 1)
+                    self.set_rc(yaw=yaw_percent)
 
-                # Yaw (Rotate)
-                elif hasattr(key, 'char') and key.char == 'q':
-                    yaw_percent = max(-100, yaw_percent - 10)
-                    self.set_rc(yaw=yaw_percent)
-                elif hasattr(key, 'char') and key.char == 'e':
-                    yaw_percent = min(100, yaw_percent + 10)
-                    self.set_rc(yaw=yaw_percent)
+                # Pitch control (I/K)
+                elif hasattr(key, 'char') and key.char == 'i':
+                    pitch_percent = min(100, pitch_percent + 1)
+                    self.set_rc(pitch=pitch_percent)
+                elif hasattr(key, 'char') and key.char == 'k':
+                    pitch_percent = max(-100, pitch_percent - 1)
+                    self.set_rc(pitch=pitch_percent)
+
+                # Roll control (J/L)
+                elif hasattr(key, 'char') and key.char == 'j':
+                    roll_percent = max(-100, roll_percent - 1)
+                    self.set_rc(roll=roll_percent)
+                elif hasattr(key, 'char') and key.char == 'l':
+                    roll_percent = min(100, roll_percent + 1)
+                    self.set_rc(roll=roll_percent)
 
                 # Reset center
                 elif key == keyboard.Key.space:
@@ -424,11 +415,15 @@ class BetaflightRC:
         print("="*50)
 
         try:
-            # Keep sending RC to maintain connection
+            # Start RC loop thread untuk prevent RX_FAILSAFE
             print("\n1. Initializing RC connection...")
-            for i in range(10):
-                self.set_rc(throttle=0)
-                time.sleep(0.1)
+            self.running = True
+            rc_thread = threading.Thread(target=self.rc_loop_thread, daemon=True)
+            rc_thread.start()
+
+            print("📡 Starting RC signal (prevents RX_FAILSAFE)...")
+            time.sleep(1)
+            print("✓ RC signal active at 10Hz")
 
             input("\nPress ENTER to ARM the drone...")
             self.arm()
@@ -470,6 +465,10 @@ class BetaflightRC:
             self.set_rc(throttle=0)
             time.sleep(1)
             self.disarm()
+
+        finally:
+            # Stop RC loop thread
+            self.running = False
 
 def main():
     print("="*50)

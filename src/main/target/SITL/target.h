@@ -51,6 +51,10 @@
 //#define SIMULATOR_GYRO_SYNC
 //#define SIMULATOR_IMU_SYNC
 //#define SIMULATOR_GYROPID_SYNC
+#define DEBUG_ARMING
+
+// Use large small_angle for SITL to allow arming at any orientation
+#define USE_RACE_PRO
 
 // file name to save config
 #define EEPROM_FILENAME "eeprom.bin"
@@ -91,6 +95,8 @@
 #define USE_UART6
 #define USE_UART7
 #define USE_UART8
+
+#define MSP_UART SERIAL_PORT_USART2
 
 #define SERIAL_PORT_COUNT 8
 

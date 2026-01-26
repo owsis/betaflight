@@ -1,7 +1,9 @@
 #!/bin/bash
 # Script untuk menjalankan Betaflight SITL
 
-cd /home/nv/Documents/betaflight
+# Get the directory where this script is located
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+cd "$SCRIPT_DIR"
 
 echo "=================================================="
 echo "  Betaflight SITL + Gazebo 11"

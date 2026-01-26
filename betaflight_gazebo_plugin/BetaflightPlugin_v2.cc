@@ -374,19 +374,19 @@ namespace gazebo
         fdm.imu_orientation_quat[2] = q_ned.Y();
         fdm.imu_orientation_quat[3] = q_ned.Z();
 
-        // Angular velocity (body frame, NED convention)
+        // Angular velocity (body frame, raw Gazebo data - let SITL handle conversions)
         fdm.imu_angular_velocity_rpy[0] = angular_vel.X();  // Roll rate
-        fdm.imu_angular_velocity_rpy[1] = -angular_vel.Y(); // Pitch rate (inverted for NED)
-        fdm.imu_angular_velocity_rpy[2] = -angular_vel.Z(); // Yaw rate (inverted for NED)
+        fdm.imu_angular_velocity_rpy[1] = angular_vel.Y();  // Pitch rate
+        fdm.imu_angular_velocity_rpy[2] = angular_vel.Z();  // Yaw rate
 
-        // Linear acceleration (body frame, NED convention)
+        // Linear acceleration (body frame, raw Gazebo data - let SITL handle conversions)
         // Add gravity component
         ignition::math::Vector3d gravity(0, 0, -9.80665);
         ignition::math::Vector3d accel_with_gravity = linear_accel - pose.Rot().RotateVectorReverse(gravity);
 
         fdm.imu_linear_acceleration_xyz[0] = accel_with_gravity.X();
-        fdm.imu_linear_acceleration_xyz[1] = -accel_with_gravity.Y();
-        fdm.imu_linear_acceleration_xyz[2] = -accel_with_gravity.Z();
+        fdm.imu_linear_acceleration_xyz[1] = accel_with_gravity.Y();
+        fdm.imu_linear_acceleration_xyz[2] = accel_with_gravity.Z();
 
         // Pressure (from altitude using barometric formula)
         // P = P0 * (1 - L*h/T0)^(g*M/R*L)
@@ -430,35 +430,37 @@ namespace gazebo
 
       void ApplyMotorCommands()
       {
-        // LiftDrag plugin generates thrust based on rotor velocity
-        // We just need to set the angular velocity of rotors correctly
+        // Direct mapping: Betaflight motor index → Gazebo joint index
+        // World file sudah di-reorder sesuai Betaflight QUAD_X order
+        // Motor 0 = Rear-Right, Motor 1 = Front-Right, Motor 2 = Rear-Left, Motor 3 = Front-Left
         
         for (size_t i = 0; i < joints.size() && i < 4; i++)
         {
-          // motor_speed is normalized [0.0, 1.0] from Betaflight
           double motor_speed = servo.motor_speed[i];
-
-          // Clamp motor speed to valid range
           if (motor_speed < 0.0) motor_speed = 0.0;
           if (motor_speed > 1.0) motor_speed = 1.0;
 
-          // Convert normalized speed to angular velocity (rad/s)
-          // motor_multipliers contains both direction and max velocity
-          // e.g., 2500 for CW, -2500 for CCW
           double target_velocity = motor_speed * motor_multipliers[i];
-          
-          // Directly set velocity (LiftDrag plugin will generate thrust)
           joints[i]->SetVelocity(0, target_velocity);
         }
 
-        // Debug output every second
+        // Debug output
         static int debug_count = 0;
         if (++debug_count % 250 == 0) {
-          std::cout << "[BetaflightPlugin] Motors: "
-                    << servo.motor_speed[0] << ", "
-                    << servo.motor_speed[1] << ", "
-                    << servo.motor_speed[2] << ", "
-                    << servo.motor_speed[3] << std::endl;
+          // Get current altitude and vertical velocity
+          ignition::math::Pose3d pose = this->base_link->WorldPose();
+          ignition::math::Vector3d linear_vel = this->base_link->WorldLinearVel();
+          
+          std::cout << "[BetaflightPlugin] Motors[0-3]: "
+                    << servo.motor_speed[0] << "," << servo.motor_speed[1] << ","
+                    << servo.motor_speed[2] << "," << servo.motor_speed[3]
+                    << " | Vel: "
+                    << joints[0]->GetVelocity(0) << ","
+                    << joints[1]->GetVelocity(0) << ","
+                    << joints[2]->GetVelocity(0) << ","
+                    << joints[3]->GetVelocity(0)
+                    << " | Alt: " << pose.Pos().Z()
+                    << " | VelZ: " << linear_vel.Z() << std::endl;
         }
       }
   };

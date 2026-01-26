@@ -20,6 +20,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "platform.h"
 
@@ -56,6 +57,11 @@ void rxMspFrameReceive(uint16_t *frame, int channelCount)
     for (int i = channelCount; i < MAX_SUPPORTED_RC_CHANNEL_COUNT; i++) {
         mspFrame[i] = 0;
     }
+
+    // Debug logging for SITL
+    // printf("[RX_MSP] Received %d channels: R:%d P:%d T:%d Y:%d AUX1:%d\n",
+    //        channelCount, frame[0], frame[1], frame[2], frame[3],
+    //        channelCount > 4 ? frame[4] : 0);
 
     rxMspFrameDone = true;
     rxMspOverrideFrameDone = true;

@@ -5,11 +5,13 @@
  * under the terms of the MIT license.
  */
 
+#include <stdio.h>
 #include <string.h>
 
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <errno.h>
 
 #include "udplink.h"
 
@@ -46,7 +48,19 @@ int udpInit(udpLink_t* link, const char* addr, int port, bool isServer)
 
 int udpSend(udpLink_t* link, const void* data, size_t size)
 {
-    return sendto(link->fd, data, size, 0, (struct sockaddr *)&link->si, sizeof(link->si));
+    int sent = sendto(link->fd, data, size, 0, (struct sockaddr *)&link->si, sizeof(link->si));
+    static int send_count = 0;
+    send_count++;
+
+    if (send_count == 1 || send_count % 250 == 0) {
+        printf("[udpSend] Sent %d bytes to port %d (total sent: %d packets)\n",
+               sent, link->port, send_count);
+        if (sent < 0) {
+            printf("[udpSend] ERROR: %s\n", strerror(errno));
+        }
+    }
+
+    return sent;
 }
 
 int udpRecv(udpLink_t* link, void* data, size_t size, uint32_t timeout_ms)
@@ -64,8 +78,8 @@ int udpRecv(udpLink_t* link, void* data, size_t size, uint32_t timeout_ms)
         return -1;
     }
 
-    socklen_t len = sizeof(link->si);;
+    socklen_t len = sizeof(link->recv);
     int ret;
-    ret = recvfrom(link->fd, data, size, 0, (struct sockaddr *)&link->si, &len);
+    ret = recvfrom(link->fd, data, size, 0, (struct sockaddr *)&link->recv, &len);
     return ret;
 }

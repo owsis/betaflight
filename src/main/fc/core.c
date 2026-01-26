@@ -18,6 +18,7 @@
  * If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <stdio.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -216,7 +217,7 @@ void resetArmingDisabled(void)
 }
 
 #ifdef USE_ACC
-static bool accNeedsCalibration(void)
+__attribute__((unused)) static bool accNeedsCalibration(void)
 {
     if (sensors(SENSOR_ACC)) {
 
@@ -268,20 +269,42 @@ static bool accNeedsCalibration(void)
 
 void updateArmingStatus(void)
 {
+#ifdef DEBUG_ARMING
+    static uint32_t lastFlags = 0xFFFFFFFF;
+    uint32_t currentFlags = getArmingDisableFlags();
+    bool flagsChanged = (currentFlags != lastFlags);
+
+    if (flagsChanged) {
+        printf("\n=== ARMING STATUS UPDATE ===\n");
+        printf("Previous Flags: 0x%08X\n", lastFlags);
+        printf("Current  Flags: 0x%08X\n", currentFlags);
+    }
+#endif
+
     if (ARMING_FLAG(ARMED)) {
         LED0_ON;
     } else {
         // Check if the power on arming grace time has elapsed
-        if ((getArmingDisableFlags() & ARMING_DISABLED_BOOT_GRACE_TIME) && (millis() >= systemConfig()->powerOnArmingGraceTime * 1000)
+        uint32_t currentMillis = millis();
+        uint32_t graceTimeMs = systemConfig()->powerOnArmingGraceTime * 1000;
+
+#ifdef DEBUG_ARMING
+        if (flagsChanged && (getArmingDisableFlags() & ARMING_DISABLED_BOOT_GRACE_TIME)) {
+            printf("[BOOT_GRACE] currentMillis=%u, graceTime=%u, elapsed=%s\n",
+                   (unsigned int)currentMillis, (unsigned int)graceTimeMs,
+                   (currentMillis >= graceTimeMs) ? "YES" : "NO");
+        }
+#endif
+
+        if ((getArmingDisableFlags() & ARMING_DISABLED_BOOT_GRACE_TIME) && (currentMillis >= graceTimeMs)
 #ifdef USE_DSHOT
-            // We also need to prevent arming until it's possible to send DSHOT commands.
-            // Otherwise if the initial arming is in crash-flip the motor direction commands
-            // might not be sent.
             && (!isMotorProtocolDshot() || dshotStreamingCommandsAreEnabled())
 #endif
         ) {
-            // If so, unset the grace time arming disable flag
             unsetArmingDisabled(ARMING_DISABLED_BOOT_GRACE_TIME);
+#ifdef DEBUG_ARMING
+            printf("[BOOT_GRACE] ✓ CLEARED\n");
+#endif
         }
 
         // Clear the crash flip active status
@@ -291,137 +314,174 @@ void updateArmingStatus(void)
         if (!isUsingSticksForArming()) {
             static bool hadRx = false;
             const bool haveRx = rxIsReceivingSignal();
-
             const bool justGotRxBack = !hadRx && haveRx;
 
+#ifdef DEBUG_ARMING
+            if (flagsChanged || justGotRxBack) {
+                printf("[RX_SIGNAL] hadRx=%d, haveRx=%d, justGotRxBack=%d, BOXARM=%d\n",
+                       hadRx, haveRx, justGotRxBack, IS_RC_MODE_ACTIVE(BOXARM));
+            }
+#endif
+
             if (justGotRxBack && IS_RC_MODE_ACTIVE(BOXARM)) {
-                // If the RX has just started to receive a signal again and the arm switch is on, apply arming restriction
-                setArmingDisabled(ARMING_DISABLED_NOT_DISARMED);
-            } else if (haveRx && !IS_RC_MODE_ACTIVE(BOXARM)) {
-                // If RX signal is OK and the arm switch is off, remove arming restriction
+                // setArmingDisabled(ARMING_DISABLED_NOT_DISARMED);
                 unsetArmingDisabled(ARMING_DISABLED_NOT_DISARMED);
+#ifdef DEBUG_ARMING
+                printf("[NOT_DISARMED] ✗ SET (RX recovered with ARM switch ON)\n");
+#endif
+            } else if (haveRx && !IS_RC_MODE_ACTIVE(BOXARM)) {
+                unsetArmingDisabled(ARMING_DISABLED_NOT_DISARMED);
+#ifdef DEBUG_ARMING
+                if (flagsChanged) {
+                    printf("[NOT_DISARMED] ✓ CLEARED\n");
+                }
+#endif
             }
 
             hadRx = haveRx;
         }
 
+        // BOXFAILSAFE check
         if (IS_RC_MODE_ACTIVE(BOXFAILSAFE)) {
             setArmingDisabled(ARMING_DISABLED_BOXFAILSAFE);
+#ifdef DEBUG_ARMING
+            if (flagsChanged) {
+                printf("[BOXFAILSAFE] ✗ SET\n");
+            }
+#endif
         } else {
             unsetArmingDisabled(ARMING_DISABLED_BOXFAILSAFE);
         }
 
-        if (calculateThrottleStatus() != THROTTLE_LOW) {
+        // THROTTLE check
+        throttleStatus_e throttleStatus = calculateThrottleStatus();
+#ifdef DEBUG_ARMING
+        if (flagsChanged || (throttleStatus != THROTTLE_LOW)) {
+            printf("[THROTTLE] status=%s, rcData[THROTTLE]=%d, mincheck=%d\n",
+                   (throttleStatus == THROTTLE_LOW) ? "LOW" : "HIGH",
+                   (int)rcData[THROTTLE], (int)rxConfig()->mincheck);
+        }
+#endif
+
+        if (throttleStatus != THROTTLE_LOW) {
             setArmingDisabled(ARMING_DISABLED_THROTTLE);
+#ifdef DEBUG_ARMING
+            printf("[THROTTLE] ✗ SET (throttle not at minimum)\n");
+#endif
         } else {
             unsetArmingDisabled(ARMING_DISABLED_THROTTLE);
         }
 
-        if (!isUpright() && !IS_RC_MODE_ACTIVE(BOXFLIPOVERAFTERCRASH)) {
+        // ANGLE check
+        bool upright = isUpright();
+        if (!upright && !IS_RC_MODE_ACTIVE(BOXFLIPOVERAFTERCRASH)) {
             setArmingDisabled(ARMING_DISABLED_ANGLE);
+#ifdef DEBUG_ARMING
+            if (flagsChanged) {
+                printf("[ANGLE] ✗ SET (not upright)\n");
+            }
+#endif
         } else {
             unsetArmingDisabled(ARMING_DISABLED_ANGLE);
         }
 
-#if defined(USE_LATE_TASK_STATISTICS)
-        if ((getCpuPercentageLate() > schedulerConfig()->cpuLatePercentageLimit)) {
-            setArmingDisabled(ARMING_DISABLED_LOAD);
-        } else {
-            unsetArmingDisabled(ARMING_DISABLED_LOAD);
+        // CALIBRATING check
+        bool calibrating = isCalibrating();
+#ifdef DEBUG_ARMING
+        if (flagsChanged && calibrating) {
+            printf("[CALIBRATING] gyro=%d, acc=%d, baro=%d, mag=%d\n",
+                   sensors(SENSOR_GYRO) && !gyroIsCalibrationComplete(),
+#ifdef USE_ACC
+                   sensors(SENSOR_ACC) && !accIsCalibrationComplete(),
+#else
+                   0,
+#endif
+#ifdef USE_BARO
+                   sensors(SENSOR_BARO) && !baroIsCalibrated(),
+#else
+                   0,
+#endif
+#ifdef USE_MAG
+                   sensors(SENSOR_MAG) && !compassIsCalibrationComplete()
+#else
+                   0
+#endif
+                   );
         }
-#endif // USE_LATE_TASK_STATISTICS
+#endif
 
-        if (isCalibrating()) {
+        if (calibrating) {
             setArmingDisabled(ARMING_DISABLED_CALIBRATING);
         } else {
             unsetArmingDisabled(ARMING_DISABLED_CALIBRATING);
-        }
-
-        if (isModeActivationConditionPresent(BOXPREARM)) {
-            if (IS_RC_MODE_ACTIVE(BOXPREARM) && !ARMING_FLAG(WAS_ARMED_WITH_PREARM)) {
-                unsetArmingDisabled(ARMING_DISABLED_NOPREARM);
-            } else {
-                setArmingDisabled(ARMING_DISABLED_NOPREARM);
+#ifdef DEBUG_ARMING
+            if (flagsChanged && !calibrating) {
+                printf("[CALIBRATING] ✓ CLEARED\n");
             }
-        }
-
-#ifdef USE_GPS_RESCUE
-        if (gpsRescueIsConfigured()) {
-            if (gpsRescueConfig()->allowArmingWithoutFix || (STATE(GPS_FIX) && (gpsSol.numSat >= gpsRescueConfig()->minSats)) ||
-            ARMING_FLAG(WAS_EVER_ARMED) || IS_RC_MODE_ACTIVE(BOXFLIPOVERAFTERCRASH)) {
-                unsetArmingDisabled(ARMING_DISABLED_GPS);
-            } else {
-                setArmingDisabled(ARMING_DISABLED_GPS);
-            }
-            if (IS_RC_MODE_ACTIVE(BOXGPSRESCUE)) {
-                setArmingDisabled(ARMING_DISABLED_RESC);
-            } else {
-                unsetArmingDisabled(ARMING_DISABLED_RESC);
-            }
-        }
 #endif
-
-#ifdef USE_DSHOT_TELEMETRY
-        // If Dshot Telemetry is enabled and any motor isn't providing telemetry, then disable arming
-        if (useDshotTelemetry && !isDshotTelemetryActive()) {
-            setArmingDisabled(ARMING_DISABLED_DSHOT_TELEM);
-        } else {
-            unsetArmingDisabled(ARMING_DISABLED_DSHOT_TELEM);
-        }
-#endif
-
-#ifdef USE_DSHOT_BITBANG
-        if (isDshotBitbangActive(&motorConfig()->dev) && dshotBitbangGetStatus() != DSHOT_BITBANG_STATUS_OK) {
-            setArmingDisabled(ARMING_DISABLED_DSHOT_BITBANG);
-        } else {
-            unsetArmingDisabled(ARMING_DISABLED_DSHOT_BITBANG);
-        }
-#endif
-
-        if (IS_RC_MODE_ACTIVE(BOXPARALYZE)) {
-            setArmingDisabled(ARMING_DISABLED_PARALYZE);
         }
 
-#ifdef USE_ACC
-        if (accNeedsCalibration()) {
-            setArmingDisabled(ARMING_DISABLED_ACC_CALIBRATION);
-        } else {
-            unsetArmingDisabled(ARMING_DISABLED_ACC_CALIBRATION);
-        }
-#endif
-
+        // MOTOR_PROTOCOL check
         if (!isMotorProtocolEnabled()) {
             setArmingDisabled(ARMING_DISABLED_MOTOR_PROTOCOL);
+#ifdef DEBUG_ARMING
+            if (flagsChanged) {
+                printf("[MOTOR_PROTOCOL] ✗ SET\n");
+            }
+#endif
         }
 
+        // ARM_SWITCH logic
         if (!isUsingSticksForArming()) {
-            if (!IS_RC_MODE_ACTIVE(BOXARM)) {
-#ifdef USE_RUNAWAY_TAKEOFF
-                unsetArmingDisabled(ARMING_DISABLED_RUNAWAY_TAKEOFF);
-#endif
-                unsetArmingDisabled(ARMING_DISABLED_CRASH_DETECTED);
-            }
-
-            /* Ignore ARMING_DISABLED_CALIBRATING if we are going to calibrate gyro on first arm */
             bool ignoreGyro = armingConfig()->gyro_cal_on_first_arm
                 && !(getArmingDisableFlags() & ~(ARMING_DISABLED_ARM_SWITCH | ARMING_DISABLED_CALIBRATING));
 
-            /* Ignore ARMING_DISABLED_THROTTLE (once arm switch is on) if we are in 3D mode */
             bool ignoreThrottle = featureIsEnabled(FEATURE_3D)
                  && !IS_RC_MODE_ACTIVE(BOX3D)
                  && !flight3DConfig()->switched_mode3d
                  && !(getArmingDisableFlags() & ~(ARMING_DISABLED_ARM_SWITCH | ARMING_DISABLED_THROTTLE));
 
-            // If arming is disabled and the ARM switch is on
+#ifdef DEBUG_ARMING
+            if (flagsChanged) {
+                printf("[ARM_SWITCH] isArmingDisabled=%d, ignoreGyro=%d, ignoreThrottle=%d, BOXARM=%d\n",
+                       isArmingDisabled(), ignoreGyro, ignoreThrottle, IS_RC_MODE_ACTIVE(BOXARM));
+            }
+#endif
+
             if (isArmingDisabled()
                 && !ignoreGyro
                 && !ignoreThrottle
                 && IS_RC_MODE_ACTIVE(BOXARM)) {
                 setArmingDisabled(ARMING_DISABLED_ARM_SWITCH);
+#ifdef DEBUG_ARMING
+                // printf("[ARM_SWITCH] ✗ SET (other flags active while ARM switch ON)\n");
+#endif
             } else if (!IS_RC_MODE_ACTIVE(BOXARM)) {
                 unsetArmingDisabled(ARMING_DISABLED_ARM_SWITCH);
             }
         }
+
+#ifdef DEBUG_ARMING
+        if (flagsChanged) {
+            printf("Final Flags: 0x%08X\n", getArmingDisableFlags());
+
+            // Decode active flags
+            armingDisableFlags_e flags = getArmingDisableFlags();
+            if (flags == 0) {
+                printf("✅ READY TO ARM!\n");
+            } else {
+                printf("❌ ARMING PREVENTED BY:\n");
+                for (int i = 0; i < 26; i++) {
+                    if (flags & (1 << i)) {
+                        printf("   [%2d] %s\n", i, armingDisableFlagNames[i]);
+                    }
+                }
+            }
+            printf("=========================\n\n");
+        }
+
+        lastFlags = getArmingDisableFlags();
+#endif
 
         if (isArmingDisabled()) {
             warningLedFlash();
