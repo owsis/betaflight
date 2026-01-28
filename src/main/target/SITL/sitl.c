@@ -44,8 +44,10 @@
 
 #include "drivers/accgyro/accgyro_virtual.h"
 #include "drivers/barometer/barometer_virtual.h"
+#include "drivers/gps_virtual.h"
 #include "flight/imu.h"
 
+#include "fc/runtime_config.h"
 #include "config/feature.h"
 #include "config/config.h"
 #include "scheduler/scheduler.h"
@@ -137,16 +139,66 @@ void updateState(const fdm_packet* pkt)
     y = constrain(-pkt->imu_linear_acceleration_xyz[1] * ACC_SCALE, -32767, 32767);
     z = constrain(-pkt->imu_linear_acceleration_xyz[2] * ACC_SCALE, -32767, 32767);
     virtualAccSet(virtualAccDev, x, y, z);
-//    printf("[acc]%lf,%lf,%lf\n", pkt->imu_linear_acceleration_xyz[0], pkt->imu_linear_acceleration_xyz[1], pkt->imu_linear_acceleration_xyz[2]);
 
     x = constrain(pkt->imu_angular_velocity_rpy[0] * GYRO_SCALE * RAD2DEG, -32767, 32767);
     y = constrain(-pkt->imu_angular_velocity_rpy[1] * GYRO_SCALE * RAD2DEG, -32767, 32767);
     z = constrain(-pkt->imu_angular_velocity_rpy[2] * GYRO_SCALE * RAD2DEG, -32767, 32767);
     virtualGyroSet(virtualGyroDev, x, y, z);
-//    printf("[gyr]%lf,%lf,%lf\n", pkt->imu_angular_velocity_rpy[0], pkt->imu_angular_velocity_rpy[1], pkt->imu_angular_velocity_rpy[2]);
+    
+    // Log FDM data periodically to diagnose crashes
+    static uint64_t fdm_count = 0;
+    fdm_count++;
+    if (fdm_count % 250 == 0) {
+        // Calculate roll/pitch from quaternion for display
+        double qw = pkt->imu_orientation_quat[0];
+        double qx = pkt->imu_orientation_quat[1];
+        double qy = pkt->imu_orientation_quat[2];
+        double qz = pkt->imu_orientation_quat[3];
+        
+        double roll = atan2(2.0 * (qw * qx + qy * qz), 1.0 - 2.0 * (qx * qx + qy * qy)) * RAD2DEG;
+        double pitch = asin(2.0 * (qw * qy - qz * qx)) * RAD2DEG;
+        double yaw = atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz)) * RAD2DEG;
+        
+        printf("[SITL FDM #%lu] Gyro: [%.1f, %.1f, %.1f] deg/s | Acc: [%.2f, %.2f, %.2f] m/s² | Attitude: R=%.1f° P=%.1f° Y=%.1f°\n",
+               (unsigned long)fdm_count,
+               pkt->imu_angular_velocity_rpy[0] * RAD2DEG,
+               pkt->imu_angular_velocity_rpy[1] * RAD2DEG, 
+               pkt->imu_angular_velocity_rpy[2] * RAD2DEG,
+               pkt->imu_linear_acceleration_xyz[0],
+               pkt->imu_linear_acceleration_xyz[1],
+               pkt->imu_linear_acceleration_xyz[2],
+               roll, pitch, yaw);
+    }
 
     // temperature in 0.01 C = 25 deg
     virtualBaroSet(pkt->pressure, 2500);
+    
+#ifdef USE_GPS
+    // Update virtual GPS from FDM packet
+    // Convert to Betaflight GPS format
+    int32_t lat = (int32_t)(pkt->latitude * 1e7);      // degrees * 1e7
+    int32_t lon = (int32_t)(pkt->longitude * 1e7);     // degrees * 1e7
+    int32_t alt = (int32_t)(pkt->altitude_msl * 100);  // meters to cm
+    
+    // Ground speed and course
+    double ground_speed_ms = sqrt(pkt->gps_velocity_ned[0] * pkt->gps_velocity_ned[0] + 
+                                   pkt->gps_velocity_ned[1] * pkt->gps_velocity_ned[1]);
+    uint16_t groundSpeed = (uint16_t)(ground_speed_ms * 100);  // m/s to cm/s
+    
+    double ground_course_rad = atan2(pkt->gps_velocity_ned[1], pkt->gps_velocity_ned[0]);
+    int16_t groundCourse_raw = (int16_t)(ground_course_rad * RAD2DEG * 10);  // degrees * 10
+    uint16_t groundCourse = (groundCourse_raw < 0) ? (uint16_t)(groundCourse_raw + 3600) : (uint16_t)groundCourse_raw;
+    
+    // NED velocity in cm/s
+    int16_t velNED_N = (int16_t)(pkt->gps_velocity_ned[0] * 100);
+    int16_t velNED_E = (int16_t)(pkt->gps_velocity_ned[1] * 100);
+    int16_t velNED_D = (int16_t)(pkt->gps_velocity_ned[2] * 100);
+    
+    virtualGpsSet(lat, lon, alt, groundSpeed, groundCourse,
+                  pkt->num_satellites, pkt->gps_fix_type,
+                  velNED_N, velNED_E, velNED_D);
+#endif
+
 #if !defined(USE_IMU_CALC)
 #if defined(SET_IMU_FROM_EULER)
     // set from Euler
@@ -589,15 +641,62 @@ static void pwmCompleteMotorUpdate(void)
         outScale = 500.0;
     }
 
-    pwmPkt.motor_speed[3] = motorsPwm[0] / outScale;
-    pwmPkt.motor_speed[0] = motorsPwm[1] / outScale;
-    pwmPkt.motor_speed[1] = motorsPwm[2] / outScale;
-    pwmPkt.motor_speed[2] = motorsPwm[3] / outScale;
+    // Betaflight motor order -> Gazebo motor order remapping
+    // BF: [0]=rear-right, [1]=front-right, [2]=rear-left, [3]=front-left
+    // Gazebo expects: [0]=front-right, [1]=rear-left, [2]=front-left, [3]=rear-right
+    pwmPkt.motor_speed[3] = motorsPwm[0] / outScale;  // BF motor 0 -> Gazebo motor 3
+    pwmPkt.motor_speed[0] = motorsPwm[1] / outScale;  // BF motor 1 -> Gazebo motor 0
+    pwmPkt.motor_speed[1] = motorsPwm[2] / outScale;  // BF motor 2 -> Gazebo motor 1
+    pwmPkt.motor_speed[2] = motorsPwm[3] / outScale;  // BF motor 3 -> Gazebo motor 2
+
+    // Log PWM output periodically
+    static uint64_t pwm_send_count = 0;
+    static uint64_t last_extreme_log = 0;
+    static uint64_t last_normal_log = 0;
+    pwm_send_count++;
+    
+    // Detect extreme values
+    bool has_extreme = false;
+    bool all_zero = true;
+    for (int i = 0; i < 4; i++) {
+        if (pwmPkt.motor_speed[i] < 0.1f || pwmPkt.motor_speed[i] > 0.9f) {
+            has_extreme = true;
+        }
+        if (pwmPkt.motor_speed[i] > 0.01f) {
+            all_zero = false;
+        }
+    }
+    
+    // Logging strategy to reduce spam:
+    // - All zero: every 2500 packets (10 seconds)
+    // - Extreme values: max every 50 packets (0.2s) to show but not spam
+    // - Normal values: every 2500 packets (10 seconds)
+    bool should_log = false;
+    if (all_zero) {
+        if ((pwm_send_count - last_extreme_log) > 2500) {
+            should_log = true;
+            last_extreme_log = pwm_send_count;
+        }
+    } else if (has_extreme && (pwm_send_count - last_extreme_log) > 50) {
+        should_log = true;
+        last_extreme_log = pwm_send_count;
+    } else if (pwm_send_count % 2500 == 0 && (pwm_send_count - last_normal_log) > 2500) {
+        should_log = true;
+        last_normal_log = pwm_send_count;
+    }
+    
+    if (should_log) {
+        printf("[SITL PWM #%lu] BF motors: [%d, %d, %d, %d] -> Gazebo: [%.3f, %.3f, %.3f, %.3f]%s\n",
+               (unsigned long)pwm_send_count,
+               motorsPwm[0], motorsPwm[1], motorsPwm[2], motorsPwm[3],
+               (double)pwmPkt.motor_speed[0], (double)pwmPkt.motor_speed[1], 
+               (double)pwmPkt.motor_speed[2], (double)pwmPkt.motor_speed[3],
+               has_extreme ? " ⚠️  EXTREME" : (all_zero ? " (off)" : ""));
+    }
 
     // get one "fdm_packet" can only send one "servo_packet"!!
     if (pthread_mutex_trylock(&updateLock) != 0) return;
     udpSend(&pwmLink, &pwmPkt, sizeof(servo_packet));
-//    printf("[pwm]%u:%u,%u,%u,%u\n", idlePulse, motorsPwm[0], motorsPwm[1], motorsPwm[2], motorsPwm[3]);
     udpSend(&pwmRawLink, &pwmRawPkt, sizeof(servo_packet_raw));
 }
 

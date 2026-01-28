@@ -85,6 +85,10 @@
 #define USE_BARO
 #define USE_VIRTUAL_BARO
 
+#define USE_GPS
+#define USE_GPS_RESCUE
+#define USE_GPS_UBLOX
+
 #define USABLE_TIMER_CHANNEL_COUNT 0
 
 #define USE_UART1
@@ -266,6 +270,13 @@ typedef struct {
     double velocity_xyz[3];             // m/s, earth frame
     double position_xyz[3];             // meters, NED from origin
     double pressure;
+    // GPS data
+    double latitude;                    // degrees
+    double longitude;                   // degrees
+    double altitude_msl;                // meters above sea level
+    double gps_velocity_ned[3];         // m/s, NED frame
+    uint8_t num_satellites;             // number of satellites
+    uint8_t gps_fix_type;               // 0=no fix, 2=2D, 3=3D
 } fdm_packet;
 
 typedef struct {
