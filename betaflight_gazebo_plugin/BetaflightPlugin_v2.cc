@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <cstring>
+#include <cmath>
 #include <iostream>
 
 namespace gazebo
@@ -25,11 +26,18 @@ namespace gazebo
     double velocity_xyz[3];                // m/s, earth frame
     double position_xyz[3];                // meters, NED from origin
     double pressure;                       // Pa
+    // GPS data
+    double latitude;                       // degrees
+    double longitude;                      // degrees
+    double altitude_msl;                   // meters above sea level
+    double gps_velocity_ned[3];            // m/s, NED frame
+    uint8_t num_satellites;                // number of satellites
+    uint8_t gps_fix_type;                  // 0=no fix, 2=2D, 3=3D
   };
 
-  // Betaflight servo packet (PWM from Betaflight)
+  // Betaflight servo packet (PWM from Betaflight) - 16 bytes
   struct servo_packet {
-    float motor_speed[4];  // normal: [0.0, 1.0], 3D: [-1.0, 1.0]
+    float motor_speed[4];  // 16 bytes: normal [0.0, 1.0], 3D [-1.0, 1.0]
   };
 
   class BetaflightPlugin : public ModelPlugin
@@ -54,7 +62,17 @@ namespace gazebo
 
       // Data
       fdm_packet fdm;
-      servo_packet servo;
+      servo_packet latest_servo;    // Latest valid PWM data
+      servo_packet stable_servo;    // Stable/filtered PWM data actually used
+      servo_packet frozen_servo;    // Frozen values during extreme change detection
+      bool has_valid_servo;         // Flag to indicate if we have valid PWM data
+      int extreme_change_streak;    // Counter for consecutive extreme changes
+      bool in_extreme_mode;         // Flag indicating we're in extreme change handling
+
+      // Diagnostics - track previous values to detect sudden changes
+      ignition::math::Vector3d prev_angular_vel;
+      ignition::math::Vector3d prev_linear_accel;
+      bool has_prev_sensor_data;
 
       // Settings
       std::string fdm_addr;
@@ -74,7 +92,13 @@ namespace gazebo
         fdm_port_in = 9002;   // Receive PWM from Betaflight
 
         memset(&fdm, 0, sizeof(fdm));
-        memset(&servo, 0, sizeof(servo));
+        memset(&latest_servo, 0, sizeof(latest_servo));
+        memset(&stable_servo, 0, sizeof(stable_servo));
+        memset(&frozen_servo, 0, sizeof(frozen_servo));
+        has_valid_servo = false;
+        extreme_change_streak = 0;
+        in_extreme_mode = false;
+        has_prev_sensor_data = false;
       }
 
       ~BetaflightPlugin()
@@ -297,47 +321,192 @@ namespace gazebo
 
       void ReceivePWM()
       {
-        ssize_t n = recv(sock_pwm, &servo, sizeof(servo), 0);
-
+        servo_packet temp_servo;
         static int recv_count = 0;
         static int error_count = 0;
+        static int invalid_count = 0;
+        static int extreme_change_count = 0;
 
-        if (n == sizeof(servo))
+        // Read all available packets to get the most recent one
+        // This prevents using stale data when multiple packets are queued
+        int packets_read = 0;
+        bool got_valid_packet = false;
+        servo_packet newest_servo;
+
+        while (packets_read < 10)  // Safety limit to prevent infinite loop
         {
-          recv_count++;
-          static bool first_pwm = true;
-          if (first_pwm)
+          ssize_t n = recv(sock_pwm, &temp_servo, sizeof(temp_servo), 0);
+
+          if (n == sizeof(temp_servo))
           {
-            std::cout << "[BetaflightPlugin] First PWM packet received (size " << n << " bytes): "
-                      << servo.motor_speed[0] << ", "
-                      << servo.motor_speed[1] << ", "
-                      << servo.motor_speed[2] << ", "
-                      << servo.motor_speed[3] << std::endl;
-            first_pwm = false;
+            recv_count++;
+            packets_read++;
+
+            // Validate motor values are in reasonable range
+            bool valid = true;
+            for (int i = 0; i < 4; i++)
+            {
+              if (std::isnan(temp_servo.motor_speed[i]) || std::isinf(temp_servo.motor_speed[i]))
+              {
+                valid = false;
+                break;
+              }
+              // Allow slightly outside [0,1] range for safety, but reject extreme values
+              if (temp_servo.motor_speed[i] < -0.1 || temp_servo.motor_speed[i] > 1.1)
+              {
+                valid = false;
+                break;
+              }
+            }
+
+            // Check for extreme changes that might indicate a crash/flip
+            if (valid && has_valid_servo)
+            {
+              bool extreme_change = false;
+              for (int i = 0; i < 4; i++)
+              {
+                float change = std::abs(temp_servo.motor_speed[i] - latest_servo.motor_speed[i]);
+                // If any motor changes by more than 40% in one step, it's suspicious
+                if (change > 0.4)
+                {
+                  extreme_change = true;
+                  break;
+                }
+              }
+
+              if (extreme_change)
+              {
+                extreme_change_count++;
+                if (extreme_change_count <= 10) {
+                  std::cerr << "[BetaflightPlugin] WARNING: Extreme motor change detected! "
+                            << "Old: [" << latest_servo.motor_speed[0] << ", "
+                            << latest_servo.motor_speed[1] << ", "
+                            << latest_servo.motor_speed[2] << ", "
+                            << latest_servo.motor_speed[3] << "] -> New: ["
+                            << temp_servo.motor_speed[0] << ", "
+                            << temp_servo.motor_speed[1] << ", "
+                            << temp_servo.motor_speed[2] << ", "
+                            << temp_servo.motor_speed[3] << "]" << std::endl;
+                }
+                // Still accept it, but log the warning
+              }
+            }
+
+            if (valid)
+            {
+              // Keep the newest valid packet
+              newest_servo = temp_servo;
+              got_valid_packet = true;
+            }
+            else
+            {
+              invalid_count++;
+              if (invalid_count < 10) {
+                std::cerr << "[BetaflightPlugin] Invalid PWM values received: "
+                          << temp_servo.motor_speed[0] << ", "
+                          << temp_servo.motor_speed[1] << ", "
+                          << temp_servo.motor_speed[2] << ", "
+                          << temp_servo.motor_speed[3] << std::endl;
+              }
+            }
+          }
+          else if (n < 0)
+          {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+              // No more data available - this is normal for non-blocking socket
+              break;
+            }
+            else
+            {
+              error_count++;
+              if (error_count < 5) {
+                std::cerr << "[BetaflightPlugin] recv() error: " << strerror(errno) << std::endl;
+              }
+              break;
+            }
+          }
+          else if (n > 0)
+          {
+            std::cerr << "[BetaflightPlugin] Received partial packet: " << n
+                      << " bytes (expected " << sizeof(temp_servo) << ")" << std::endl;
+            break;
+          }
+          else
+          {
+            // n == 0: connection closed
+            break;
+          }
+        }
+
+        // Update latest_servo with the newest valid packet received in this cycle
+        if (got_valid_packet)
+        {
+          // Log raw data received from SITL
+          static int raw_log_count = 0;
+          if (++raw_log_count % 250 == 0 || recv_count < 10) {
+            std::cout << "[BetaflightPlugin] RAW PWM from SITL: ["
+                      << newest_servo.motor_speed[0] << ", "
+                      << newest_servo.motor_speed[1] << ", "
+                      << newest_servo.motor_speed[2] << ", "
+                      << newest_servo.motor_speed[3] << "]" << std::endl;
+          }
+          
+          // Apply smoothing/filtering to prevent extreme changes
+          if (!has_valid_servo)
+          {
+            // First time receiving data - accept immediately
+            latest_servo = newest_servo;
+            stable_servo = newest_servo;
+            has_valid_servo = true;
+            extreme_change_streak = 0;
+            
+            std::cout << "[BetaflightPlugin] First PWM accepted: ["
+                      << stable_servo.motor_speed[0] << ", "
+                      << stable_servo.motor_speed[1] << ", "
+                      << stable_servo.motor_speed[2] << ", "
+                      << stable_servo.motor_speed[3] << "]" << std::endl;
+          }
+          else
+          {
+            // DISABLED EXTREME CHANGE DETECTION - accept all valid packets immediately
+            // Previous filtering was causing 20ms lag → FC overcompensation → oscillation
+            latest_servo = newest_servo;
+            stable_servo = newest_servo;
+            
+            // For debugging, still detect extreme changes but don't block them
+            servo_packet& baseline = stable_servo;
+            bool is_extreme_change = false;
+            float max_change = 0.0;
+            for (int i = 0; i < 4; i++)
+            {
+              float change = std::abs(newest_servo.motor_speed[i] - baseline.motor_speed[i]);
+              if (change > max_change) max_change = change;
+              if (change > 0.5)  // Higher threshold just for logging
+              {
+                is_extreme_change = true;
+              }
+            }
+
+            if (is_extreme_change)
+            {
+              // Just log it, don't block
+              std::cout << "[BetaflightPlugin] Large change detected (max Δ=" << max_change 
+                        << ") - ACCEPTING immediately" << std::endl;
+            }
           }
 
           if (recv_count % 250 == 0) {
             std::cout << "[BetaflightPlugin] PWM packets received: " << recv_count
-                      << " | motors: " << servo.motor_speed[0] << ", "
-                      << servo.motor_speed[1] << ", "
-                      << servo.motor_speed[2] << ", "
-                      << servo.motor_speed[3] << std::endl;
-          }
-        }
-        else if (n < 0)
-        {
-          if (errno != EAGAIN && errno != EWOULDBLOCK)
-          {
-            error_count++;
-            if (error_count < 5) {
-              std::cerr << "[BetaflightPlugin] recv() error: " << strerror(errno) << std::endl;
+                      << " | motors: " << newest_servo.motor_speed[0] << ", "
+                      << newest_servo.motor_speed[1] << ", "
+                      << newest_servo.motor_speed[2] << ", "
+                      << newest_servo.motor_speed[3];
+            if (packets_read > 1) {
+              std::cout << " | (" << packets_read << " packets in queue)";
             }
+            std::cout << std::endl;
           }
-        }
-        else if (n > 0)
-        {
-          std::cerr << "[BetaflightPlugin] Received partial packet: " << n
-                    << " bytes (expected " << sizeof(servo) << ")" << std::endl;
         }
       }
 
@@ -352,6 +521,45 @@ namespace gazebo
         ignition::math::Vector3d angular_vel = this->base_link->RelativeAngularVel();
         ignition::math::Vector3d linear_accel = this->base_link->RelativeLinearAccel();
 
+        // DIAGNOSTIC: Detect sudden changes in sensor data (possible physics instability)
+        if (has_prev_sensor_data)
+        {
+          // Calculate changes in sensor readings
+          ignition::math::Vector3d gyro_change = angular_vel - prev_angular_vel;
+          ignition::math::Vector3d accel_change = linear_accel - prev_linear_accel;
+          
+          double gyro_change_mag = gyro_change.Length();
+          double accel_change_mag = accel_change.Length();
+          
+          // Thresholds for "sudden" changes that might trigger FC overreaction
+          // At 250Hz update rate (4ms), sudden change > 100 rad/s² in gyro is suspicious
+          // or > 50 m/s² in accel
+          const double GYRO_SPIKE_THRESHOLD = 10.0;    // rad/s change per cycle (4ms)
+          const double ACCEL_SPIKE_THRESHOLD = 20.0;   // m/s² change per cycle (4ms)
+          
+          if (gyro_change_mag > GYRO_SPIKE_THRESHOLD || accel_change_mag > ACCEL_SPIKE_THRESHOLD)
+          {
+            std::cout << "[BetaflightPlugin] ⚠️  SENSOR SPIKE DETECTED!" << std::endl;
+            std::cout << "  Gyro change: " << gyro_change_mag << " rad/s (threshold: " 
+                      << GYRO_SPIKE_THRESHOLD << ")" << std::endl;
+            std::cout << "    Prev: [" << prev_angular_vel.X() << ", " << prev_angular_vel.Y() 
+                      << ", " << prev_angular_vel.Z() << "]" << std::endl;
+            std::cout << "    Now:  [" << angular_vel.X() << ", " << angular_vel.Y() 
+                      << ", " << angular_vel.Z() << "]" << std::endl;
+            std::cout << "  Accel change: " << accel_change_mag << " m/s² (threshold: " 
+                      << ACCEL_SPIKE_THRESHOLD << ")" << std::endl;
+            std::cout << "    Prev: [" << prev_linear_accel.X() << ", " << prev_linear_accel.Y() 
+                      << ", " << prev_linear_accel.Z() << "]" << std::endl;
+            std::cout << "    Now:  [" << linear_accel.X() << ", " << linear_accel.Y() 
+                      << ", " << linear_accel.Z() << "]" << std::endl;
+          }
+        }
+        
+        // Store current values for next cycle comparison
+        prev_angular_vel = angular_vel;
+        prev_linear_accel = linear_accel;
+        has_prev_sensor_data = true;
+
         // Position (NED frame: North-East-Down)
         // Gazebo uses ENU (East-North-Up), convert to NED
         fdm.position_xyz[0] = pose.Pos().Y();   // North (Gazebo Y)
@@ -363,11 +571,27 @@ namespace gazebo
         fdm.velocity_xyz[1] = linear_vel.X();   // East
         fdm.velocity_xyz[2] = -linear_vel.Z();  // Down
 
-        // Orientation quaternion (Gazebo to NED)
-        ignition::math::Quaterniond q = pose.Rot();
-        // Convert ENU to NED: rotate -90 deg around Z, then 180 deg around X
-        ignition::math::Quaterniond q_enu_to_ned(0, 1, 0, 0); // 180 deg around X
-        ignition::math::Quaterniond q_ned = q_enu_to_ned * q;
+        // Orientation quaternion (Gazebo ENU to Betaflight NED)
+        // ENU: X=East, Y=North, Z=Up
+        // NED: X=North, Y=East, Z=Down
+        // Transformation: swap X↔Y, negate Z
+        // In quaternion: rotate -90° around Z axis
+        ignition::math::Quaterniond q_gazebo = pose.Rot();
+        
+        // Create rotation quaternion for -90° around Z
+        // q = cos(θ/2) + sin(θ/2) * axis
+        // -90° = -π/2, so θ/2 = -π/4
+        double angle = -M_PI / 2.0;
+        ignition::math::Quaterniond q_z_rotation(cos(angle/2), 0, 0, sin(angle/2));
+        
+        // Apply rotation: NED = Rz(-90°) * ENU * Rz(90°)
+        // Simplified: just swap and negate in quaternion representation
+        ignition::math::Quaterniond q_ned(
+            q_gazebo.W(),   // w stays same
+            q_gazebo.Y(),   // x_ned = y_enu (North from North)
+            q_gazebo.X(),   // y_ned = x_enu (East from East) 
+            -q_gazebo.Z()   // z_ned = -z_enu (Down from Up)
+        );
 
         fdm.imu_orientation_quat[0] = q_ned.W();
         fdm.imu_orientation_quat[1] = q_ned.X();
@@ -393,6 +617,32 @@ namespace gazebo
         // Simplified: P ≈ 101325 * exp(-h/8000)
         double altitude = -fdm.position_xyz[2]; // Convert NED down to altitude
         fdm.pressure = 101325.0 * exp(-altitude / 8000.0);
+
+        // GPS data (simulated from position)
+        // Use home location as reference point (can be configured)
+        // Default: somewhere arbitrary, can be set via SDF parameters
+        static const double home_latitude = -35.3632607;   // Example: CMAC field
+        static const double home_longitude = 149.1652351;
+        static const double home_altitude_msl = 584.0;     // meters
+        
+        // Convert NED position to lat/lon offset
+        // Approximate: 1 degree latitude ≈ 111,320 m
+        // 1 degree longitude ≈ 111,320 * cos(latitude) m
+        double meters_per_deg_lat = 111320.0;
+        double meters_per_deg_lon = 111320.0 * cos(home_latitude * M_PI / 180.0);
+        
+        fdm.latitude = home_latitude + (fdm.position_xyz[0] / meters_per_deg_lat);
+        fdm.longitude = home_longitude + (fdm.position_xyz[1] / meters_per_deg_lon);
+        fdm.altitude_msl = home_altitude_msl - fdm.position_xyz[2]; // NED Z is down
+        
+        // GPS velocity (same as earth-frame velocity, already in NED)
+        fdm.gps_velocity_ned[0] = fdm.velocity_xyz[0];
+        fdm.gps_velocity_ned[1] = fdm.velocity_xyz[1];
+        fdm.gps_velocity_ned[2] = fdm.velocity_xyz[2];
+        
+        // Simulated GPS fix
+        fdm.num_satellites = 12;  // Good GPS fix
+        fdm.gps_fix_type = 3;     // 3D fix
       }
 
       void SendFDM()
@@ -430,13 +680,22 @@ namespace gazebo
 
       void ApplyMotorCommands()
       {
+        // Don't apply commands if we haven't received valid PWM data yet
+        if (!has_valid_servo)
+        {
+          return;
+        }
+
         // Direct mapping: Betaflight motor index → Gazebo joint index
         // World file sudah di-reorder sesuai Betaflight QUAD_X order
         // Motor 0 = Rear-Right, Motor 1 = Front-Right, Motor 2 = Rear-Left, Motor 3 = Front-Left
-        
+
         for (size_t i = 0; i < joints.size() && i < 4; i++)
         {
-          double motor_speed = servo.motor_speed[i];
+          // Use stable_servo instead of latest_servo for smoother control
+          double motor_speed = stable_servo.motor_speed[i];
+          
+          // Clamp to valid range
           if (motor_speed < 0.0) motor_speed = 0.0;
           if (motor_speed > 1.0) motor_speed = 1.0;
 
@@ -451,16 +710,23 @@ namespace gazebo
           ignition::math::Pose3d pose = this->base_link->WorldPose();
           ignition::math::Vector3d linear_vel = this->base_link->WorldLinearVel();
           
-          std::cout << "[BetaflightPlugin] Motors[0-3]: "
-                    << servo.motor_speed[0] << "," << servo.motor_speed[1] << ","
-                    << servo.motor_speed[2] << "," << servo.motor_speed[3]
-                    << " | Vel: "
-                    << joints[0]->GetVelocity(0) << ","
-                    << joints[1]->GetVelocity(0) << ","
-                    << joints[2]->GetVelocity(0) << ","
-                    << joints[3]->GetVelocity(0)
-                    << " | Alt: " << pose.Pos().Z()
-                    << " | VelZ: " << linear_vel.Z() << std::endl;
+          std::cout << "[BetaflightPlugin] ===== STATUS @ count " << debug_count << " =====" << std::endl;
+          std::cout << "  RAW from SITL:  [" 
+                    << latest_servo.motor_speed[0] << ", "
+                    << latest_servo.motor_speed[1] << ", "
+                    << latest_servo.motor_speed[2] << ", "
+                    << latest_servo.motor_speed[3] << "]" << std::endl;
+          std::cout << "  STABLE (used):  [" 
+                    << stable_servo.motor_speed[0] << ", "
+                    << stable_servo.motor_speed[1] << ", "
+                    << stable_servo.motor_speed[2] << ", "
+                    << stable_servo.motor_speed[3] << "]" << std::endl;
+          std::cout << "  Motor Vel:      [" 
+                    << joints[0]->GetVelocity(0) << ", "
+                    << joints[1]->GetVelocity(0) << ", "
+                    << joints[2]->GetVelocity(0) << ", "
+                    << joints[3]->GetVelocity(0) << "]" << std::endl;
+          std::cout << "  Alt: " << pose.Pos().Z() << " m | VelZ: " << linear_vel.Z() << " m/s" << std::endl;
         }
       }
   };

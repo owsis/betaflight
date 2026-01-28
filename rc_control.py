@@ -24,7 +24,7 @@ RC_CENTER = 1500
 RC_MAX = 2000
 
 class BetaflightRC:
-    def __init__(self, host='127.0.0.1', port=5761):  # Port 5761 (UART1) - MSP default
+    def __init__(self, host='127.0.0.1', port=5762):  # Port 5761 (UART1) - MSP default
         self.host = host
         self.port = port
         self.sock = None
@@ -161,12 +161,21 @@ class BetaflightRC:
         """ARM the drone (enable motors) - via AUX1 switch"""
         print("\n⚠️  ARMING DRONE via AUX1 switch...")
 
-        # Set AUX1 HIGH (2000) to ARM
-        # Make sure throttle is LOW
-        self.set_rc(throttle=0, aux1=1)
+        # CRITICAL: Set throttle to absolute minimum and all other channels neutral
+        # Betaflight requires throttle < mincheck (1050) to arm
+        print("   Setting throttle to MINIMUM (0%)...")
+        for i in range(10):  # Send throttle=0 multiple times to ensure it's set
+            self.set_rc(throttle=0, roll=0, pitch=0, yaw=0, aux1=0)
+            time.sleep(0.05)
+        
+        # Now set AUX1 HIGH to ARM
+        print("   Setting AUX1 to HIGH (ARM)...")
+        for i in range(10):  # Send arm command multiple times
+            self.set_rc(throttle=0, roll=0, pitch=0, yaw=0, aux1=1)
+            time.sleep(0.05)
 
-        print("✓ AUX1 set to HIGH (ARM)")
-        print("   Drone should ARM now!")
+        print("✓ ARM command sent (throttle=0%, AUX1=HIGH)")
+        print("   Check SITL console for arming status...")
 
     def disarm(self):
         """DISARM the drone (disable motors) - via AUX1 switch"""
@@ -424,32 +433,66 @@ class BetaflightRC:
             print("📡 Starting RC signal (prevents RX_FAILSAFE)...")
             time.sleep(1)
             print("✓ RC signal active at 10Hz")
+            
+            # CRITICAL: Ensure throttle is at 0 and stabilize
+            print("\n2. Setting throttle to MINIMUM and stabilizing...")
+            for i in range(20):  # Send throttle=0 for 2 seconds
+                self.set_rc(throttle=0, roll=0, pitch=0, yaw=0, aux1=0)
+                time.sleep(0.1)
+            print("✓ Throttle confirmed at MINIMUM")
 
-            input("\nPress ENTER to ARM the drone...")
+            input("\n3. Press ENTER to ARM the drone...")
             self.arm()
-            time.sleep(2)
+            print("   Waiting 3 seconds for arm to complete...")
+            time.sleep(3)
+            print("✓ Drone should be ARMED now")
 
-            input("\nPress ENTER to TAKEOFF (increase throttle)...")
+            input("\n4. Press ENTER to TAKEOFF (increase throttle)...")
             print("🚁 Taking off...")
 
-            # Gradual throttle increase
-            for throttle in range(0, 55, 5):
+            # Gradual throttle increase - REDUCED target to prevent climbing
+            # Old: 60% caused uncontrolled climb
+            # New: 52-55% should be closer to hover equilibrium
+            for throttle in range(0, 52, 1):
                 self.set_rc(throttle=throttle)
                 print(f"   Throttle: {throttle}%", end='\r')
-                time.sleep(0.5)
+                time.sleep(0.1)
             print()
 
-            # Hover
-            self.hover(throttle=55, duration=5)
+            # Hover at reduced throttle
+            print("\n⚠️  Monitor altitude in Gazebo console!")
+            print("   If climbing: Press Ctrl+C and reduce throttle further")
+            print("   If descending: Increase throttle slightly")
+            self.hover(throttle=52, duration=5)
 
-            input("\nPress ENTER to LAND (decrease throttle)...")
+            input("\n5. Press ENTER to FLY FORWARD (gentle pitch for 3 seconds)...")
+            print("➡️  Flying forward...")
+            
+            # Very gentle pitch forward - keep throttle stable
+            # Start with tiny pitch to avoid aggressive maneuver
+            start_time = time.time()
+            while time.time() - start_time < 3.0:
+                # Keep throttle same as hover (52%), only gentle pitch
+                self.set_rc(throttle=52, pitch=0.5)  # 0.5% forward (very gentle)
+                elapsed = time.time() - start_time
+                print(f"   Forward flight: {elapsed:.1f}/3.0s - Pitch: 0.5% (gentle)", end='\r')
+                time.sleep(0.1)
+            print()
+            
+            # Return pitch to neutral and hover briefly
+            print("⏸️  Returning to level hover...")
+            for i in range(10):
+                self.set_rc(throttle=52, pitch=0)
+                time.sleep(0.1)
+
+            input("\n6. Press ENTER to LAND (decrease throttle)...")
             print("🛬 Landing...")
 
-            # Gradual throttle decrease
-            for throttle in range(55, -1, -5):
+            # Gradual throttle decrease from 52%
+            for throttle in range(52, -1, -1):
                 self.set_rc(throttle=throttle)
                 print(f"   Throttle: {throttle}%", end='\r')
-                time.sleep(0.5)
+                time.sleep(0.1)
             print()
 
             time.sleep(2)
